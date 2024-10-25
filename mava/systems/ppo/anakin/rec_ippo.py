@@ -51,6 +51,7 @@ from mava.utils import make_env as environments
 from mava.utils.checkpointing import Checkpointer
 from mava.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
 from mava.utils.logger import LogEvent, MavaLogger
+from mava.utils.multistep import truncated_generalized_advantage_estimation
 from mava.utils.network_utils import get_action_head
 from mava.utils.total_timestep_checker import check_total_timesteps
 from mava.utils.training import make_learning_rate
@@ -151,64 +152,41 @@ def get_learner_fn(
             )
             return learner_state, transition
 
-        # STEP ENVIRONMENT FOR ROLLOUT LENGTH
+        # Step environment for rollout length
         learner_state, traj_batch = jax.lax.scan(
             _env_step, learner_state, None, config.system.rollout_length
         )
 
-        # CALCULATE ADVANTAGE
-        (
-            params,
-            opt_states,
-            key,
-            env_state,
-            last_timestep,
-            last_done,
-            hstates,
-        ) = learner_state
+        # Calculate advantage
+        (params, opt_states, key, env_state, last_timestep, last_done, hstates) = learner_state
 
-        # Add a batch dimension to the observation.
+        # Add a batch dimension to the last observation.
         batched_last_observation = tree.map(lambda x: x[jnp.newaxis, :], last_timestep.observation)
-        ac_in = (
-            batched_last_observation,
-            last_done[jnp.newaxis, :],
-        )
+        ac_in = (batched_last_observation, last_done[jnp.newaxis, :])
 
         # Run the network.
         _, last_val = critic_apply_fn(params.critic_params, hstates.critic_hidden_state, ac_in)
         # Squeeze out the batch dimension and mask out the value of terminal states.
         last_val = last_val.squeeze(0)
+        last_val = jnp.where(last_done, jnp.zeros_like(last_val), last_val)
 
-        def _calculate_gae(
-            traj_batch: RNNPPOTransition, last_val: chex.Array, last_done: chex.Array
-        ) -> Tuple[chex.Array, chex.Array]:
-            def _get_advantages(
-                carry: Tuple[chex.Array, chex.Array, chex.Array], transition: RNNPPOTransition
-            ) -> Tuple[Tuple[chex.Array, chex.Array, chex.Array], chex.Array]:
-                gae, next_value, next_done = carry
-                done, value, reward = transition.done, transition.value, transition.reward
-                gamma = config.system.gamma
-                delta = reward + gamma * next_value * (1 - next_done) - value
-                gae = delta + gamma * config.system.gae_lambda * (1 - next_done) * gae
-                return (gae, value, done), gae
-
-            _, advantages = jax.lax.scan(
-                _get_advantages,
-                (jnp.zeros_like(last_val), last_val, last_done),
-                traj_batch,
-                reverse=True,
-                unroll=16,
-            )
-            return advantages, advantages + traj_batch.value
-
-        advantages, targets = _calculate_gae(traj_batch, last_val, last_done)
+        r_t = traj_batch.reward
+        v_t = jnp.concatenate([traj_batch.value, last_val[jnp.newaxis, ...]], axis=0)
+        d_t = 1.0 - traj_batch.done.astype(jnp.float32)
+        d_t = (d_t * config.system.gamma).astype(jnp.float32)
+        advantages, targets = truncated_generalized_advantage_estimation(
+            r_t,
+            d_t,
+            config.system.gae_lambda,
+            v_t,
+            time_major=True,
+        )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
             """Update the network for a single epoch."""
 
             def _update_minibatch(train_state: Tuple, batch_info: Tuple) -> Tuple:
                 """Update the network for a single minibatch."""
-                # UNPACK TRAIN STATE AND BATCH INFO
                 params, opt_states, key = train_state
                 traj_batch, advantages, targets = batch_info
 
@@ -220,7 +198,7 @@ def get_learner_fn(
                     key: chex.PRNGKey,
                 ) -> Tuple:
                     """Calculate the actor loss."""
-                    # RERUN NETWORK
+                    # Rerun network
 
                     obs_and_done = (traj_batch.obs, traj_batch.done)
                     _, actor_policy = actor_apply_fn(
@@ -243,7 +221,6 @@ def get_learner_fn(
                     loss_actor = loss_actor.mean()
                     # The seed will be used in the TanhTransformedDistribution:
                     entropy = actor_policy.entropy(seed=key).mean()
-
                     total_loss = loss_actor - config.system.ent_coef * entropy
                     return total_loss, (loss_actor, entropy)
 
@@ -254,13 +231,13 @@ def get_learner_fn(
                     targets: chex.Array,
                 ) -> Tuple:
                     """Calculate the critic loss."""
-                    # RERUN NETWORK
+                    # Rerun network
                     obs_and_done = (traj_batch.obs, traj_batch.done)
                     _, value = critic_apply_fn(
                         critic_params, traj_batch.hstates.critic_hidden_state[0], obs_and_done
                     )
 
-                    # CALCULATE VALUE LOSS
+                    # Calculate value loss
                     value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(
                         -config.system.clip_eps, config.system.clip_eps
                     )
@@ -271,7 +248,7 @@ def get_learner_fn(
                     total_loss = config.system.vf_coef * value_loss
                     return total_loss, (value_loss)
 
-                # CALCULATE ACTOR LOSS
+                # Calculate actor loss
                 key, entropy_key = jax.random.split(key)
                 actor_grad_fn = jax.value_and_grad(_actor_loss_fn, has_aux=True)
                 actor_loss_info, actor_grads = actor_grad_fn(
@@ -282,7 +259,7 @@ def get_learner_fn(
                     entropy_key,
                 )
 
-                # CALCULATE CRITIC LOSS
+                # Calculate critic loss
                 critic_grad_fn = jax.value_and_grad(_critic_loss_fn, has_aux=True)
                 critic_loss_info, critic_grads = critic_grad_fn(
                     params.critic_params, opt_states.critic_opt_state, traj_batch, targets
@@ -308,13 +285,13 @@ def get_learner_fn(
                     (critic_grads, critic_loss_info), axis_name="device"
                 )
 
-                # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+                # Update actor params and optimiser state
                 actor_updates, actor_new_opt_state = actor_update_fn(
                     actor_grads, opt_states.actor_opt_state
                 )
                 actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
-                # UPDATE CRITIC PARAMS AND OPTIMISER STATE
+                # Update critic params and optimiser state
                 critic_updates, critic_new_opt_state = critic_update_fn(
                     critic_grads, opt_states.critic_opt_state
                 )
@@ -323,7 +300,6 @@ def get_learner_fn(
                 new_params = Params(actor_new_params, critic_new_params)
                 new_opt_state = OptStates(actor_new_opt_state, critic_new_opt_state)
 
-                # PACK LOSS INFO
                 total_loss = actor_loss_info[0] + critic_loss_info[0]
                 value_loss = critic_loss_info[1]
                 actor_loss = actor_loss_info[1][0]
@@ -340,7 +316,7 @@ def get_learner_fn(
             params, opt_states, traj_batch, advantages, targets, key = update_state
             key, shuffle_key, entropy_key = jax.random.split(key, 3)
 
-            # SHUFFLE MINIBATCHES
+            # Shuffle minibatches
             batch = (traj_batch, advantages, targets)
             num_recurrent_chunks = (
                 config.system.rollout_length // config.system.recurrent_chunk_size
@@ -365,7 +341,7 @@ def get_learner_fn(
             )
             minibatches = tree.map(lambda x: jnp.swapaxes(x, 1, 0), reshaped_batch)
 
-            # UPDATE MINIBATCHES
+            # Update minibatches
             (params, opt_states, entropy_key), loss_info = jax.lax.scan(
                 _update_minibatch, (params, opt_states, entropy_key), minibatches
             )
@@ -389,7 +365,7 @@ def get_learner_fn(
             key,
         )
 
-        # UPDATE EPOCHS
+        # Update epochs
         update_state, loss_info = jax.lax.scan(
             _update_epoch, update_state, None, config.system.ppo_epochs
         )
