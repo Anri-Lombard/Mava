@@ -8,7 +8,7 @@ hydra-core==1.3.2
 id-marl-eval @ git+https://github.com/instadeepai/marl-eval
 jax==0.4.30
 jaxlib==0.4.30
-jaxmarl
+jaxmarl @ git+https://github.com/RuanJohn/JaxMARL@unpin-jax
 jumanji @ git+https://github.com/sash-a/jumanji@old_jumanji  # Includes a few extra MARL envs
 matrax @ git+https://github.com/instadeepai/matrax
 mujoco==3.1.3
